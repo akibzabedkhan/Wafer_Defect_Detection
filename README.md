@@ -2,12 +2,12 @@
 Machine Learning for Linking Manufacturing Defects to Yield Prediction in Semiconductor Wafer Maps
 
 Requirements for running the model:
-python 3.12.10
-torch
-torchvision
-numpy
-scikit-learn
-matplotlib
+1. python 3.12.10
+2. torch
+3. torchvision
+4. numpy
+5. scikit-learn
+6. matplotlib
 
 To run the model:
 1. Download the necessary dataset at https://github.com/Junliangwangdhu/WaferMap (WM811K is non functional currently)
