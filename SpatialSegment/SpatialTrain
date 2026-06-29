@@ -1,0 +1,404 @@
+"""
+SpatialTrain.py
+Training loop for Stage 1 spatial segmentation.
+"""
+
+import torch
+import os
+import sys
+import numpy as np
+from sklearn.metrics import f1_score, classification_report
+from torch.amp import autocast
+from SpatialYield import compute_yield_loss, batch_yield_summary, print_yield_report
+
+sys.path.append(os.path.dirname(__file__))
+from SpatialConfig import (
+    learning_rate,
+    device,
+    epochs,
+    loss_ignore_index,
+    mixed_precision,
+    checkpoint_dir,
+    WM38K_classes,
+    Dropout_amount,
+    number_of_classes,
+)
+from SpatialModel import buildSpatialModel, num_defect_classes
+from SpatialDataload import getWM38KLoaders, MixedLoaders
+
+DICE_WEIGHT = 0.5
+BCE_WEIGHT = 0.5
+THRESHOLD = 0.5
+
+
+# ─────────────────────────────────────────────────────────────────
+# Loss functions
+# ─────────────────────────────────────────────────────────────────
+def masked_bce_loss(seg_criterion, logits, masks):
+    """
+    BCE loss with background pixels masked out.
+
+    logits : [B, num_defect_classes, H, W]
+    masks  : [B, num_defect_classes, H, W]
+    """
+    masks = masks.to(device)
+    valid = (masks != loss_ignore_index).any(dim=1, keepdim=True).expand_as(masks)
+    targets = masks.clamp(0.0, 1.0)
+
+    loss_map = seg_criterion(logits, targets)
+    loss_map = loss_map * valid.float()
+
+    return loss_map.sum() / valid.float().sum().clamp(min=1)
+
+
+def dice_loss(logits, masks):
+    """
+    Soft Dice loss per class averaged across classes.
+    Directly optimises spatial overlap between prediction and target.
+
+    logits : [B, num_defect_classes, H, W]
+    masks  : [B, num_defect_classes, H, W]
+    """
+    masks = masks.to(device)
+    valid = (masks != loss_ignore_index).any(dim=1, keepdim=True).expand_as(masks)
+    targets = masks.clamp(0.0, 1.0)
+    probs = torch.sigmoid(logits)
+
+    probs = probs * valid.float()
+    targets = targets * valid.float()
+
+    smooth = 1e-6
+    dice = 0.0
+
+    for c in range(num_defect_classes):
+        p = probs[:,   c].reshape(-1)
+        t = targets[:, c].reshape(-1)
+        intersection = (p * t).sum()
+        dice += 1 - (2 * intersection + smooth) / \
+                           (p.sum() + t.sum() + smooth)
+
+    return dice / num_defect_classes
+
+
+def combined_loss(seg_criterion, logits, masks):
+    """BCE + Dice combined loss."""
+    bce = masked_bce_loss(seg_criterion, logits, masks)
+    dice = dice_loss(logits, masks)
+    return BCE_WEIGHT * bce + DICE_WEIGHT * dice
+
+
+# ─────────────────────────────────────────────────────────────────
+# Train / eval loops
+# ─────────────────────────────────────────────────────────────────
+def train_one_epoch(model, loader, seg_criterion, cls_criterion, optimizer, scaler):
+    model.train()
+    total_loss = 0.0
+    total_seg_loss = 0.0
+    total_cls_loss = 0.0
+
+    for images, masks, labels, wafer_maps in loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        if mixed_precision:
+            with autocast(device_type='cuda'):
+                seg_logits, cls_logits, _ = model(images)
+                seg_loss = combined_loss(seg_criterion, seg_logits, masks)
+                cls_loss = cls_criterion(cls_logits, labels)
+                loss = seg_loss + cls_loss
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            seg_logits, cls_logits, _ = model(images)
+            seg_loss = combined_loss(seg_criterion, seg_logits, masks)
+            cls_loss = cls_criterion(cls_logits, labels)
+            loss = seg_loss + cls_loss
+            loss.backward()
+            optimizer.step()
+
+        total_loss += loss.item()
+        total_seg_loss += seg_loss.item()
+        total_cls_loss += cls_loss.item()
+
+    n = len(loader)
+    return total_loss / n, total_seg_loss / n, total_cls_loss / n
+
+
+def evaluate(model, loader, seg_criterion, cls_criterion):
+    model.eval()
+    total_loss = 0.0
+    all_tp  = np.zeros(num_defect_classes)
+    all_fp  = np.zeros(num_defect_classes)
+    all_fn  = np.zeros(num_defect_classes)
+    wafer_preds_class = []
+    wafer_preds_segment = []
+    wafer_targets = []
+    all_yield_results = []
+
+    with torch.no_grad():
+        for images, masks, labels, wafer_maps in loader:
+            images = images.to(device)
+            labels_dev = labels.to(device)
+
+            seg_logits, cls_logits, _ = model(images)
+
+            seg_loss = combined_loss(seg_criterion, seg_logits, masks)
+            cls_loss = cls_criterion(cls_logits, labels_dev)
+            total_loss += (seg_loss + cls_loss).item()
+
+            # ── Pixel metrics ────────────────────────────────────
+            masks_dev = masks.to(device)
+            valid = (masks_dev != loss_ignore_index).any(dim=1, keepdim=True).expand_as(masks_dev)
+            targets = masks_dev.clamp(0.0, 1.0)
+            preds = (torch.sigmoid(seg_logits) > THRESHOLD).float()
+
+            for c in range(num_defect_classes):
+                p  = preds[:,   c][valid[:, c]]
+                t  = targets[:, c][valid[:, c]]
+                all_tp[c] += (p * t).sum().item()
+                all_fp[c] += (p * (1 - t)).sum().item()
+                all_fn[c] += ((1 - p) * t).sum().item()
+
+            # Seperated wafer metrics to compare the pixel metrics verses full wafer class
+            wafer_pred_class = (torch.sigmoid(cls_logits[:, :num_defect_classes]) > THRESHOLD).cpu().numpy()
+            wafer_pred_segment = (preds.amax(dim=(2, 3)) > THRESHOLD).cpu().numpy()
+
+            wafer_target = labels[:, :num_defect_classes].numpy()
+            wafer_preds_class.append(wafer_pred_class)
+            wafer_preds_segment.append(wafer_pred_segment)
+
+            wafer_targets.append(wafer_target)
+
+            yield_results = compute_yield_loss(seg_logits, wafer_maps)
+            all_yield_results.extend(yield_results)
+
+    # ── Aggregate metrics ────────────────────────────────────────
+    iou_per_class = all_tp / (all_tp + all_fp + all_fn).clip(min=1e-6)
+    precision_pixel = all_tp / (all_tp + all_fp).clip(min=1e-6)
+    recall_pixel = all_tp / (all_tp + all_fn).clip(min=1e-6)
+    f1_pixel = 2 * precision_pixel * recall_pixel / (precision_pixel + recall_pixel).clip(min=1e-6)
+    instance_counts = all_tp + all_fn
+    # Need to compute accuracy 
+
+    unweighted_miou = float(np.nanmean(iou_per_class))
+    valid_cls = instance_counts > 0
+    weighted_miou = float(
+        (iou_per_class[valid_cls] * instance_counts[valid_cls]).sum()
+        / instance_counts[valid_cls].sum().clip(min=1e-6)
+    )
+    #metric split beteween pixel and wafer
+    wafer_preds_class   = np.vstack(wafer_preds_class)
+    wafer_preds_segment = np.vstack(wafer_preds_segment)
+    wafer_targets = np.vstack(wafer_targets)
+
+    #Class wise metrics
+    exact_match_class = (wafer_preds_class == wafer_targets).all(axis = 1).mean()
+    macro_f1_class = f1_score(wafer_targets, wafer_preds_class, average='macro',  zero_division=0)
+    micro_f1_class = f1_score(wafer_targets, wafer_preds_class, average='micro',  zero_division=0)
+    report_class = classification_report(
+                      wafer_targets, wafer_preds_class,
+                      target_names=WM38K_classes[:num_defect_classes],
+                      zero_division=0,
+                  )
+    exact_match_segement = (wafer_preds_segment == wafer_targets).all(axis = 1).mean()
+    macro_f1_segment = f1_score(wafer_targets, wafer_preds_segment, average = 'macro',  zero_division = 0)
+    micro_f1_segment = f1_score(wafer_targets, wafer_preds_segment, average = 'micro',  zero_division = 0)
+    report_segment = classification_report(
+                      wafer_targets, wafer_preds_segment,
+                      target_names = WM38K_classes[:num_defect_classes],
+                      zero_division = 0,
+                  )
+    
+    
+
+    metrics = {
+        #Pixel level
+        'iou_per_class':   {WM38K_classes[c]: iou_per_class[c] for c in range(num_defect_classes)},
+        'precision_pixel':       {WM38K_classes[c]: precision_pixel[c]     for c in range(num_defect_classes)},
+        'recall_pixel':          {WM38K_classes[c]: recall_pixel[c]        for c in range(num_defect_classes)},
+        'f1_pixel':              {WM38K_classes[c]: f1_pixel[c]            for c in range(num_defect_classes)},
+        'unweighted_miou': unweighted_miou,
+        'weighted_miou':   weighted_miou,
+        #Wafer level class header
+        'exact_match_class': exact_match_class,
+        'macro_f1_class': macro_f1_class,
+        'micro_f1_class': micro_f1_class,
+        'report_class': report_class,
+        #Wafer level seg max pool
+        'exact_match_segment': exact_match_segement,
+        'macro_f1_segment': macro_f1_segment,
+        'micro_f1_segment': micro_f1_segment,
+        'report_segment': report_segment
+    }
+    yield_summary = batch_yield_summary(all_yield_results)
+    print_yield_report(yield_summary)
+    metrics['yield_summary'] = yield_summary
+
+    return total_loss / len(loader), metrics
+
+
+def print_metrics(metrics, split_name="Val"):
+    print(f"\n{split_name} Metrics:")
+
+    print(f"\n  [Pixel-level Segmentation]")
+    print(f"  mIoU (unweighted) : {metrics['unweighted_miou']:.4f}")
+    print(f"  mIoU (weighted)   : {metrics['weighted_miou']:.4f}")
+    print(f"\n  {'Class':<12} {'IoU':>8} {'Precision':>10} {'Recall':>8} {'F1':>8}")
+    print(f"  {'-'*50}")
+    for name in WM38K_classes[:num_defect_classes]:
+        print(f"  {name:<12} "
+              f"{metrics['iou_per_class'][name]:>8.4f} "
+              f"{metrics['precision_pixel'][name]:>10.4f} "
+              f"{metrics['recall_pixel'][name]:>8.4f} "
+              f"{metrics['f1_pixel'][name]:>8.4f}")
+
+    print(f"\n  [Wafer-level — cls_head (trained classifier)]")
+    print(f"  Exact Match : {metrics['exact_match_class']:.4f}")
+    print(f"  Macro F1    : {metrics['macro_f1_class']:.4f}")
+    print(f"  Micro F1    : {metrics['micro_f1_class']:.4f}")
+    print(f"\n{metrics['report_class']}")
+
+    print(f"\n  [Wafer-level — seg max-pool (pixel proxy)]")
+    print(f"  Exact Match : {metrics['exact_match_segment']:.4f}")
+    print(f"  Macro F1    : {metrics['macro_f1_segment']:.4f}")
+    print(f"  Micro F1    : {metrics['micro_f1_segment']:.4f}")
+    print(f"\n{metrics['report_segment']}")
+
+# ─────────────────────────────────────────────────────────────────
+# Main training entry point
+# ─────────────────────────────────────────────────────────────────
+def trainSpatialModel(lr=learning_rate, dropout_rate=Dropout_amount, num_epochs=epochs):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    train_loader, val_loader, test_loader, mixed_data = getWM38KLoaders()
+    model, seg_criterion, cls_criterion, optimizer    = buildSpatialModel(
+        lr = lr, dropout=dropout_rate
+    )
+
+    scaler = torch.amp.GradScaler('cuda', enabled=mixed_precision)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode = 'min', factor = 0.5, patience = 5
+    )
+
+    best_val_loss = float('inf')
+    best_metrics  = None
+
+    print("\nStage 1 Training — Single-type wafers")
+    print("=" * 60)
+
+    for epoch in range(1, num_epochs + 1):
+        train_loss, train_seg, train_cls = train_one_epoch(
+            model, train_loader, seg_criterion, cls_criterion, optimizer, scaler
+        )
+        val_loss, val_metrics = evaluate(
+            model, val_loader, seg_criterion, cls_criterion
+        )
+        scheduler.step(val_loss)
+
+        print(f"Epoch {epoch:3d} / {num_epochs} | "
+                f"Train Loss: {train_loss:.4f} "
+                f"(seg={train_seg:.4f} cls={train_cls:.4f}) | "
+                f"Val Loss: {val_loss:.4f} | "
+                f"mIoU: {val_metrics['unweighted_miou']:.4f} | "
+                f"Macro F1 (cls): {val_metrics['macro_f1_class']:.4f} | "
+                f"Macro F1 (seg): {val_metrics['macro_f1_segment']:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_metrics  = val_metrics
+            torch.save(
+                model.state_dict(),
+                os.path.join(checkpoint_dir, "best_spatial_model.pt")
+            )
+            print(f"Checkpoint saved (val_loss={best_val_loss:.4f})")
+
+    # ── Final test evaluation ────────────────────────────────────
+    print("\nFinal evaluation on test set:")
+    print("=" * 60)
+    model.load_state_dict(torch.load(os.path.join(checkpoint_dir, "best_spatial_model.pt")))
+    test_loss, test_metrics = evaluate(model, test_loader, seg_criterion, cls_criterion)
+    print_metrics(test_metrics, split_name="Test")
+    return best_metrics, test_metrics, mixed_data
+
+
+
+"""Training for the mixed defect still needs code validation and clean up"""
+def trainStage2(stage1_checkpoint = None):
+    """
+    Stage 2 fine-tuning on mixed-type wafers using pseudo-labels
+    generated by the Stage 1 model.
+    """
+    from SpatialConfig import stage2_epochs, stage2_lr, stage2_checkpoint, weight_decay
+
+    os.makedirs(os.path.dirname(stage2_checkpoint), exist_ok = True)
+
+    # ── Load Stage 1 model ──────────────────────────────────────
+    if stage1_checkpoint is None:
+        stage1_checkpoint = os.path.join(checkpoint_dir, "best_spatial_model.pt")
+
+    model, seg_criterion, cls_criterion, _ = buildSpatialModel()
+    model.load_state_dict(torch.load(stage1_checkpoint, map_location=device))
+    print(f"Stage 1 checkpoint loaded from: {stage1_checkpoint}")
+
+    #Making the pseudo labels
+    train_loader, val_loader, test_loader = MixedLoaders(model)
+
+   
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr = stage2_lr,
+        weight_decay = weight_decay,
+    )
+
+    scaler = torch.amp.GradScaler('cuda', enabled=mixed_precision)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+
+    best_val_loss = float('inf')
+    best_metrics = None
+
+    print("\nStage 2 Training — Mixed-type wafers")
+    print("=" * 60)
+
+    for epoch in range(1, stage2_epochs + 1):
+        train_loss, train_seg, train_cls = train_one_epoch(
+            model, train_loader, seg_criterion, cls_criterion, optimizer, scaler
+        )
+        val_loss, val_metrics = evaluate(
+            model, val_loader, seg_criterion, cls_criterion
+        )
+        scheduler.step(val_loss)
+
+        print(f"Epoch {epoch:3d} / {stage2_epochs} | "
+                f"Train Loss: {train_loss:.4f} "
+                f"(seg={train_seg:.4f} cls={train_cls:.4f}) | "
+                f"Val Loss: {val_loss:.4f} | "
+                f"mIoU: {val_metrics['unweighted_miou']:.4f} | "
+                f"Macro F1 (cls): {val_metrics['macro_f1_class']:.4f} | "
+                f"Macro F1 (seg): {val_metrics['macro_f1_segment']:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_metrics = val_metrics
+            torch.save(model.state_dict(), stage2_checkpoint)
+            print(f"Checkpoint saved (val_loss = {best_val_loss:.4f})")
+
+    # ── Final test evaluation ────────────────────────────────────
+    print("\nStage 2 final evaluation on test set:")
+    print("=" * 60)
+    model.load_state_dict(torch.load(stage2_checkpoint, map_location = device))
+    test_loss, test_metrics = evaluate(
+        model, test_loader, seg_criterion, cls_criterion
+    )
+    print_metrics(test_metrics, split_name="Stage 2 Test")
+
+    return best_metrics, test_metrics
+
+if __name__ == "__main__":
+    best_metrics_s1, test_metrics_s1, mixed_data = trainSpatialModel()
+    best_metrics_s2, test_metrics_s2 = trainStage2()
